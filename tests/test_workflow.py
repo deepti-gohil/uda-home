@@ -20,7 +20,7 @@ def test_resolved_ticket_uses_knowledge_base():
     )
     assert state["status"] == "resolved"
     assert state["resolution"]
-    assert state["confidence"] >= 0.72
+    assert state["confidence"] >= 0.40
     assert any(d["category"] == "notifications" for d in state["retrieved_docs"])
 
 
@@ -51,7 +51,7 @@ def test_off_topic_ticket_escalates_on_low_confidence():
         channel="chat",
     )
     assert state["status"] == "escalated"
-    assert state["confidence"] < 0.72
+    assert state["confidence"] < 0.40
 
 
 def test_session_continuity_across_two_turns_same_thread():

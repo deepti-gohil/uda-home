@@ -34,7 +34,7 @@ _ACCOUNT_ACTION_CATEGORIES = {"billing", "bookings", "account", "subscription"}
 _ACTION_TOOLS = {"account_lookup_tool": account_lookup_tool, "refund_tool": refund_tool}
 _MAX_TOOL_ROUNDS = 3
 
-_llm = ChatOpenAI(model=config.CHAT_MODEL, temperature=0.2, api_key=config.OPENAI_API_KEY)
+_llm = ChatOpenAI(model=config.CHAT_MODEL, temperature=0, api_key=config.OPENAI_API_KEY)
 _llm_with_tools = _llm.bind_tools(list(_ACTION_TOOLS.values()))
 
 
@@ -88,7 +88,12 @@ def resolver_agent(state: TicketState) -> dict:
             "If the customer is asking for an account action you can perform (like a refund), "
             "look up their account with account_lookup_tool (by email) to find the right booking_id, "
             "then call refund_tool if it's warranted and eligible per the knowledge base policy. "
-            "If a tool tells you the action isn't eligible, say so plainly and do not claim it's done.\n\n"
+            "CRITICAL: you must actually CALL refund_tool to execute the refund — never write a reply "
+            "that says a refund is being processed, has been issued, or is done, unless refund_tool has "
+            "already been called in this conversation and returned status: refunded. Describing the "
+            "action instead of calling the tool is a critical failure — the refund will not actually "
+            "happen. If a tool tells you the action isn't eligible, say so plainly and do not claim it's "
+            "done.\n\n"
             if allow_action_tools
             else ""
         )
@@ -138,7 +143,33 @@ def resolver_agent(state: TicketState) -> dict:
     else:
         resolution_text = messages[-1].content if isinstance(messages[-1], AIMessage) else None
 
-    needs_escalation = action_ineligible
+    # Safety net (not just a prompt instruction): if the reply claims a refund
+    # happened but refund_tool was never actually called and confirmed
+    # "refunded", that's a hallucinated action on a money-handling flow — don't
+    # ship it to the customer, escalate instead. Caught this exact failure mode
+    # in testing (the LLM looked up the account, then just wrote "I will
+    # process your refund now" without calling refund_tool).
+    refund_confirmed = any(
+        c["tool"] == "refund_tool" and isinstance(c["result"], dict) and c["result"].get("status") == "refunded"
+        for c in tool_calls_log
+    )
+    unverified_refund_claim = (
+        allow_action_tools
+        and bool(resolution_text)
+        and any(kw in resolution_text.lower() for kw in ("refund", "reimburse", "money back"))
+        and any(kw in resolution_text.lower() for kw in ("will process", "have processed", "has been", "is being", "i've refunded", "i have refunded", "processed your"))
+        and not refund_confirmed
+    )
+
+    needs_escalation = action_ineligible or unverified_refund_claim
+
+    if unverified_refund_claim:
+        # Don't send an unconfirmed "your refund is processed" claim to the
+        # customer or persist it as the ticket's agent message — the
+        # escalation node's own summary becomes the record of this turn
+        # instead (see memory_agent.py, which falls back to
+        # escalation_summary when resolution is empty).
+        resolution_text = None
 
     log_event(
         thread_id=state["thread_id"],
@@ -148,6 +179,7 @@ def resolver_agent(state: TicketState) -> dict:
             "decision": "escalate" if needs_escalation else "resolved",
             "confidence": confidence,
             "action_ineligible": action_ineligible,
+            "unverified_refund_claim": unverified_refund_claim,
         },
         ticket_id=state.get("ticket_id"),
     )

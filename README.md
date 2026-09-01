@@ -125,8 +125,9 @@ solution/
   based on urgency/sentiment/category, with a second confidence-based
   escalation check inside the Resolver after RAG retrieval — architecture.md §7.
 - **RAG**: FAISS over OpenAI embeddings of the `knowledge` table, cached to
-  disk, rebuilt automatically when the table changes; a 0.72 cosine-similarity
-  confidence gate decides resolve-vs-escalate — architecture.md §5.
+  disk, rebuilt automatically when the table changes; a 0.40 cosine-similarity
+  confidence gate (calibrated empirically against text-embedding-3-small —
+  see `config.py`) decides resolve-vs-escalate — architecture.md §5.
 - **Tools**: `kb_search_tool`, `account_lookup_tool`, `refund_tool`,
   `write_long_term_memory`/`search_long_term_memory` — all plain functions
   with structured returns and input validation, DB paths resolved absolutely

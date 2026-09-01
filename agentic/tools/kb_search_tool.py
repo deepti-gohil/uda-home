@@ -19,8 +19,24 @@ import config
 from data.core.db import get_core_session
 from data.core.models import Knowledge
 
+# We compute cosine similarity ourselves from FAISS's raw squared-L2 distance
+# rather than trusting FAISS's built-in `similarity_search_with_relevance_scores`
+# heuristic. That heuristic (score = 1 - L2/sqrt(2), or the MAX_INNER_PRODUCT
+# variant which just returns the raw dot product) turned out to badly mis-rank
+# and mis-scale results for OpenAI's text-embedding-3 vectors in testing — e.g.
+# scoring an off-topic query HIGHER than an on-topic one. The formula below is
+# exact (not a heuristic): OpenAI embeddings are unit-normalized, so for unit
+# vectors a, b: ||a - b||^2 = 2 - 2*cos(a, b)  =>  cos(a, b) = 1 - ||a-b||^2 / 2.
+# FAISS's default IndexFlatL2 returns squared L2 distance, so this applies
+# directly to `similarity_search_with_score`'s raw output.
+_INDEX_FORMAT_VERSION = 3  # bump to force a rebuild when the format changes
+
 _METADATA_FILE = config.KNOWLEDGE_INDEX_DIR / "_meta.json"
 _vectorstore: FAISS | None = None
+
+
+def _l2_squared_to_cosine_similarity(l2_squared: float) -> float:
+    return 1.0 - (float(l2_squared) / 2.0)
 
 
 def _load_articles() -> list[Knowledge]:
@@ -32,7 +48,11 @@ def _build_or_load_index() -> FAISS:
     global _vectorstore
 
     articles = _load_articles()
-    current_meta = {"count": len(articles), "max_id": max((a.id for a in articles), default=0)}
+    current_meta = {
+        "count": len(articles),
+        "max_id": max((a.id for a in articles), default=0),
+        "format_version": _INDEX_FORMAT_VERSION,
+    }
 
     stale = True
     if _METADATA_FILE.exists():
@@ -43,7 +63,9 @@ def _build_or_load_index() -> FAISS:
 
     if not stale and any(config.KNOWLEDGE_INDEX_DIR.glob("index.faiss")):
         _vectorstore = FAISS.load_local(
-            str(config.KNOWLEDGE_INDEX_DIR), embeddings, allow_dangerous_deserialization=True
+            str(config.KNOWLEDGE_INDEX_DIR),
+            embeddings,
+            allow_dangerous_deserialization=True,
         )
         return _vectorstore
 
@@ -78,7 +100,7 @@ def kb_search_tool(query: str, k: int = 3) -> dict:
         return {"error": "empty_query", "results": []}
 
     index = _get_index()
-    hits = index.similarity_search_with_relevance_scores(query, k=k)
+    hits = index.similarity_search_with_score(query, k=k)  # raw squared-L2 distance
 
     results = [
         {
@@ -86,9 +108,9 @@ def kb_search_tool(query: str, k: int = 3) -> dict:
             "title": doc.metadata["title"],
             "category": doc.metadata["category"],
             "content": doc.page_content.split("\n\n", 1)[-1],
-            "score": round(max(0.0, min(1.0, score)), 4),
+            "score": round(max(0.0, min(1.0, _l2_squared_to_cosine_similarity(l2_squared))), 4),
         }
-        for doc, score in hits
+        for doc, l2_squared in hits
     ]
     results.sort(key=lambda r: r["score"], reverse=True)
     top_score = results[0]["score"] if results else 0.0

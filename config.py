@@ -34,6 +34,11 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 CHAT_MODEL = os.getenv("UDA_HUB_CHAT_MODEL", "gpt-4o-mini")
 EMBEDDING_MODEL = os.getenv("UDA_HUB_EMBEDDING_MODEL", "text-embedding-3-small")
 
-CONFIDENCE_THRESHOLD = 0.72
+# Calibrated empirically against text-embedding-3-small cosine similarity
+# (see agentic/tools/kb_search_tool.py): genuinely relevant matches against
+# our knowledge base scored ~0.47-0.68, off-topic-but-domain-adjacent queries
+# scored ~0.22-0.27, and fully unrelated queries scored ~0.07-0.14. 0.40 sits
+# cleanly in the gap between "off-topic" and "on-topic".
+CONFIDENCE_THRESHOLD = 0.40
 REFUND_WINDOW_DAYS = 30
 MAX_MEMORIES_RECALLED = 3

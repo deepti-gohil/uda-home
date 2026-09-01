@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import uuid
 
 from tests.conftest import requires_openai_key
 
@@ -25,7 +26,13 @@ def _make_booking(days_ago: int) -> tuple[int, int]:
         session.add(account)
         session.flush()
 
-        user = User(account_id=account.id, full_name="Test User", email=f"test.{days_ago}@example.com")
+        # uuid suffix (not just days_ago) so repeated pytest runs against the
+        # persistent dev DB never collide on the unique email constraint.
+        user = User(
+            account_id=account.id,
+            full_name="Test User",
+            email=f"test.{days_ago}.{uuid.uuid4().hex[:8]}@example.com",
+        )
         session.add(user)
         session.flush()
 

@@ -36,8 +36,8 @@ flowchart TD
     CLS --> SUP{Supervisor Agent<br/>routing decision}
     SUP -- "low/medium urgency<br/>known category" --> RES[Resolver Agent]
     SUP -- "critical urgency OR<br/>very negative sentiment OR<br/>unroutable category" --> ESC[Escalation Agent]
-    RES -- "confidence >= 0.72<br/>resolved" --> MEM[Memory Agent]
-    RES -- "confidence < 0.72<br/>OR tool says not eligible" --> ESC
+    RES -- "confidence >= 0.40<br/>resolved" --> MEM[Memory Agent]
+    RES -- "confidence < 0.40<br/>OR tool says not eligible" --> ESC
     ESC --> MEM
     MEM --> END([Response returned / ticket updated])
 
@@ -50,7 +50,7 @@ flowchart TD
 |---|---|---|
 | **Classifier** | `agentic/agents/classifier_agent.py` | Reads the raw ticket text + metadata and produces a structured `Classification` (category, urgency, sentiment, one-line summary) via an LLM structured-output call. This is the only agent that talks to the *raw* customer text. |
 | **Supervisor** | `agentic/agents/supervisor_agent.py` | Pure routing logic (rule-based, not an LLM call) over the classifier's output plus any long-term memory context. Decides `resolver` vs `escalation`. Documented as a conditional edge, not a node with side effects. |
-| **Resolver** | `agentic/agents/resolver_agent.py` | The "do the work" agent. Calls `kb_search_tool` to retrieve candidate knowledge articles (RAG), and — when the category needs an account action — calls `account_lookup_tool` / `refund_tool`. Computes a confidence score from retrieval similarity and tool outcomes. If confident, drafts the resolution message; if not, sets `needs_escalation=True`. |
+| **Resolver** | `agentic/agents/resolver_agent.py` | The "do the work" agent. Calls `kb_search_tool` to retrieve candidate knowledge articles (RAG), and — when the category needs an account action — calls `account_lookup_tool` / `refund_tool`. Computes a confidence score from retrieval similarity and tool outcomes. If confident, drafts the resolution message; if not, sets `needs_escalation=True`. Includes a code-level guard (not just a prompt instruction) against a real failure mode caught in testing: the LLM narrating "I've processed your refund" without actually calling `refund_tool`. If the reply claims a refund happened but no `refund_tool` call in this turn returned `status: refunded`, the reply is discarded and the ticket escalates instead of shipping an unconfirmed claim to the customer. |
 | **Escalation** | `agentic/agents/escalation_agent.py` | Builds a structured hand-off summary (ticket, classification, what the resolver already tried, and why it couldn't finish) for a human agent, and sets ticket status to `escalated`. |
 | **Memory** | `agentic/agents/memory_agent.py` | Terminal node. Persists the outcome to `ticket_messages`/`tickets` (core DB), writes a resolution summary and any customer preference it noticed to `long_term_memory`, and appends a structured line to `agent_run_log`. |
 
@@ -110,24 +110,37 @@ persists **across sessions**, unlike the checkpointer which is scoped to one
 
 ## 5. Retrieval (RAG) — how it works
 
-1. `agentic/tools/kb_search_tool.py` builds an in-memory **FAISS** index the first
-   time it's called (and caches it to `data/models/knowledge_index/` so it doesn't
-   re-embed on every process start).
+1. `agentic/tools/kb_search_tool.py` builds a **FAISS** index the first time it's
+   called (and caches it to `data/models/knowledge_index/` so it doesn't re-embed
+   on every process start; a version marker forces a rebuild if the index format
+   changes).
 2. Every row in `knowledge` (core DB) is embedded with OpenAI
    `text-embedding-3-small` as `f"{title}\n\n{content}"`.
-3. `kb_search_tool(query: str, k: int = 3)` embeds the query, does a similarity
-   search, and returns the top-`k` articles with a `score` (cosine similarity,
-   0..1) and `article_id` for traceability — every resolver response can be traced
-   back to the specific KB article(s) it used.
-4. **Confidence & escalation gate**: `confidence = top_score` from step 3 (blended
-   down slightly if a required tool call failed — see `resolver_agent.py`). If
-   `confidence < CONFIDENCE_THRESHOLD` (0.72, `agentic/tools/kb_search_tool.py`),
-   the resolver does **not** fabricate an answer — it sets `needs_escalation=True`
-   and the graph's conditional edge sends the ticket to the Escalation agent
-   instead of returning a low-confidence guess. This is the escalation-on-no-match
-   requirement.
-5. If the index is stale (row count in `knowledge` differs from the cached index's
-   metadata), it is rebuilt automatically on next use.
+3. `kb_search_tool(query: str, k: int = 3)` embeds the query, calls FAISS's
+   `similarity_search_with_score` (raw **squared L2 distance**, FAISS's default
+   `IndexFlatL2`), and converts that to an exact cosine similarity itself rather
+   than trusting FAISS's built-in `similarity_search_with_relevance_scores`
+   heuristic — that heuristic (and its `MAX_INNER_PRODUCT` variant) was tested
+   against our data and badly mis-ranked results for OpenAI's text-embedding-3
+   vectors (an off-topic query scored *higher* than an on-topic one). Since
+   OpenAI's embeddings are unit-normalized, the conversion is exact, not a
+   heuristic: for unit vectors `a, b`, `||a-b||^2 = 2 - 2*cos(a,b)`, so
+   `cos(a,b) = 1 - ||a-b||^2 / 2`. Returns the top-`k` articles with that `score`
+   (cosine similarity, 0..1) and `article_id` for traceability — every resolver
+   response can be traced back to the specific KB article(s) it used.
+4. **Confidence & escalation gate**: `confidence = top_score` from step 3. If
+   `confidence < CONFIDENCE_THRESHOLD` (`config.py`, currently **0.40** —
+   calibrated empirically: genuinely relevant matches scored ~0.47-0.68,
+   off-topic-but-domain-adjacent queries ~0.22-0.27, fully unrelated queries
+   ~0.07-0.14, so 0.40 sits cleanly in the gap), the resolver does **not**
+   fabricate an answer — it sets `needs_escalation=True` and the graph's
+   conditional edge sends the ticket to the Escalation agent instead of
+   returning a low-confidence guess. This is the escalation-on-no-match
+   requirement. Separately, if retrieval clears the bar but a downstream tool
+   call (e.g. `refund_tool`) reports the requested action isn't eligible, the
+   resolver escalates for that reason instead — see `resolver_agent.py`.
+5. If the index is stale (row count in `knowledge` differs from the cached
+   index's metadata), it is rebuilt automatically on next use.
 
 ## 6. Tools (support operations)
 
