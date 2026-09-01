@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+data/external/*.db
+data/core/*.db
+data/core/*.sqlite
+data/models/knowledge_index/
+.pytest_cache/
